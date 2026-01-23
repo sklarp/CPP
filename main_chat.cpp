@@ -45,6 +45,7 @@ void printMap(int size, const Pos& player, const Pos& exitPos, const std::vector
         std::cout << row << '\n';
     }
 
+    
     std::cout << edge << '\n';
 }
 
