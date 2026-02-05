@@ -1,7 +1,8 @@
 /*
 // Build+search the most syllable-efficient spoken form for a number (computed fresh each run).
-// Compile: g++ silly.cpp -o silly
-// Run: ./silly 27 --quiet */
+// Compile: g++ -O2 -pthread silly.cpp -o silly
+// Run: ./silly 27 --quiet
+*/
 
 #include <iostream>
 #include <string>
@@ -9,6 +10,8 @@
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
+#include <thread>
+#include <mutex>
 
 using std::string;
 using std::vector;
@@ -21,10 +24,10 @@ struct LargeName { string word; int syl; int base; int zeroesAdd; };
 
 struct Entry {
     int value{};
-    vector<int> syllables; 
-    vector<string> names; 
-    vector<string> equations; 
-    int original{};
+    vector<int> syllables;
+    vector<string> names;
+    vector<string> equations;
+    int original{};   // base spoken syllables for the plain number
     int zeroes{};
     int digits{};
     int nonzero{};
@@ -44,7 +47,7 @@ struct UnaryOp {
     string id;
     int syllables;
     string text;
-    int value; 
+    int value;
     int pemdas_input;
     int pemdas_result;
 };
@@ -86,8 +89,8 @@ static const vector<OneName> one_names = {
 };
 
 static const vector<TenName> ten_names = {
-    {"",0,"",0}, 
-    {"",0,"",0}, 
+    {"",0,"",0},
+    {"",0,"",0},
     {"twenty",2,"twentieth",3},
     {"thirty",2,"thirtieth",3},
     {"forty",2,"fortieth",3},
@@ -112,6 +115,35 @@ static const vector<string> superscripts = {
     "²⁰","²¹","²²","²³"
 };
 
+// -------- small parallel helpers --------
+static int default_threads() {
+    unsigned hc = std::thread::hardware_concurrency();
+    return (hc == 0 ? 4 : (int)hc);
+}
+
+template <class Func>
+static void parallel_for_chunks(int start, int end, int threads, Func fn) {
+    if (end <= start) return;
+    if (threads <= 1) {
+        fn(start, end);
+        return;
+    }
+
+    int total = end - start;
+    int chunk = (total + threads - 1) / threads;
+
+    vector<std::thread> ts;
+    ts.reserve(threads);
+
+    for (int t = 0; t < threads; ++t) {
+        int b = start + t * chunk;
+        int e = std::min(end, b + chunk);
+        if (b >= e) break;
+        ts.emplace_back([=, &fn]() { fn(b, e); });
+    }
+    for (auto& th : ts) th.join();
+}
+
 static BaseOut base_syllables(int n) {
     if (n < 20) {
         return { one_names[n].cardSyl, one_names[n].card,
@@ -126,7 +158,6 @@ static BaseOut base_syllables(int n) {
             return { t.cardSyl, t.card, t.ordSyl, t.ord, 1, 2 };
         }
 
-        // Use already-built ones for n_mod (< n)
         const auto& mod = number_names[n_mod];
         const auto& t = ten_names[n_div];
 
@@ -139,7 +170,6 @@ static BaseOut base_syllables(int n) {
         return { syl_card, name_card, syl_frac, name_frac, 0, 2 };
     }
 
-    // Choose largest unit
     int large_index = 0;
     while (large_index + 1 < (int)large_names.size() && large_names[large_index + 1].base <= n) {
         large_index++;
@@ -151,7 +181,6 @@ static BaseOut base_syllables(int n) {
 
     if (n_mod == 0) {
         const auto& div = number_names[n_div];
-        // ordinal: add "th" like Python
         return {
             div.syllables[1] + L.syl,
             div.names[1] + " " + L.word,
@@ -222,7 +251,7 @@ static void number_names_generator(int leave_point, int max_number, bool show_pr
 
     int max_syllables = 0;
 
-    // Base fill
+    // Base fill (kept sequential because base_syllables reads earlier number_names)
     for (int n = 0; n <= max_number; ++n) {
         BaseOut b = base_syllables(n);
         int adj_zeroes = b.zeroes;
@@ -234,7 +263,6 @@ static void number_names_generator(int leave_point, int max_number, bool show_pr
         e.names.assign(pemdas_count, b.n_name);
         e.equations.assign(pemdas_count, std::to_string(n));
 
-        // index 0 is the "fraction/ordinal-ish" form
         e.syllables[0] = b.frac_syl;
         e.names[0] = b.frac_name;
 
@@ -254,27 +282,33 @@ static void number_names_generator(int leave_point, int max_number, bool show_pr
         number_names[2].names[0] = "halve";
     }
 
-    // syllable_key[s][pemdas] = sorted list of values with that syllable count at that pemdas
     vector<vector<vector<int>>> syllable_key;
     syllable_key.resize(1);
     syllable_key[0].resize(pemdas_count);
 
     vector<UnaryOp> unary = {
         {"²", 1, " squared", 2, 2, 2},
-        {"³", 1, " cubed", 3, 2, 2},
+        {"³", 1, " cubed",   3, 2, 2},
     };
 
     vector<BinaryOp> binary = {
-        {"+", 1, " plus ", "", 5, 5, 5},
+        {"+", 1, " plus ",  "", 5, 5, 5},
         {"*", 1, " times ", "", 3, 4, 4},
         {"*", 1, " times ", "", 3, 3, 3},
         {"-", 2, " minus ", "", 5, 4, 5},
-        {"/", 2, " over ", "", 3, 2, 4},
+        {"/", 2, " over ",  "", 3, 2, 4},
         {"fraction", 0, " ", "s", 2, 0, 2},
         {"^", 2, " to the ", "", 2, 0, 2},
     };
 
     int min_missing = 1;
+
+    // striped locks for number_names updates
+    static constexpr int LOCK_STRIPES = 8192;
+    vector<std::mutex> stripes(LOCK_STRIPES);
+    auto lock_for = [&](int out) -> std::mutex& { return stripes[(unsigned)out % LOCK_STRIPES]; };
+
+    int threads = default_threads();
 
     for (int s = 1; s <= max_syllables; ++s) {
         if (show_progress) {
@@ -284,20 +318,43 @@ static void number_names_generator(int leave_point, int max_number, bool show_pr
         syllable_key.resize(s + 1);
         syllable_key[s].assign(pemdas_count, {});
 
-        // Fill syllable_key[s][u]
-        for (int n = min_missing; n <= max_number; ++n) {
-            for (int u = 0; u < pemdas_count; ++u) {
-                int cur = number_names[n].syllables[u];
-                if (cur < s) break;
-                if (cur == s) {
-                    syllable_key[s][u].push_back(n);
-                } else if (u > 0) {
-                    break;
+        // ---- Fill syllable_key[s][u] in parallel ----
+        vector<vector<vector<int>>> locals(threads, vector<vector<int>>(pemdas_count));
+        parallel_for_chunks(min_missing, max_number + 1, threads, [&](int b, int e) {
+            // map this worker to an index by hashing the thread id is annoying;
+            // instead: use a small per-call static counter is also annoying.
+            // Simple approach: allocate by chunk-start index -> deterministic worker slot:
+            int slot = (b - min_missing) * threads / std::max(1, (max_number + 1 - min_missing));
+            if (slot < 0) slot = 0;
+            if (slot >= threads) slot = threads - 1;
+
+            auto& local = locals[slot];
+            for (int n = b; n < e; ++n) {
+                for (int u = 0; u < pemdas_count; ++u) {
+                    int cur = number_names[n].syllables[u];
+                    if (cur < s) break;
+                    if (cur == s) {
+                        local[u].push_back(n);
+                    } else if (u > 0) {
+                        break;
+                    }
                 }
             }
+        });
+
+        for (int u = 0; u < pemdas_count; ++u) {
+            for (int t = 0; t < threads; ++t) {
+                auto& v = locals[t][u];
+                if (!v.empty()) {
+                    syllable_key[s][u].insert(syllable_key[s][u].end(), v.begin(), v.end());
+                }
+            }
+            std::sort(syllable_key[s][u].begin(), syllable_key[s][u].end());
+            syllable_key[s][u].erase(std::unique(syllable_key[s][u].begin(), syllable_key[s][u].end()),
+                                     syllable_key[s][u].end());
         }
 
-        // Binary ops
+        // ---- Binary ops (parallel over left_list chunks) ----
         for (const auto& op : binary) {
             auto [min_left, max_left] = get_first_extremes(op.id, min_missing, max_number);
 
@@ -305,79 +362,108 @@ static void number_names_generator(int leave_point, int max_number, bool show_pr
                 const auto& left_list = syllable_key[left_syl][op.pemdas_left];
                 if (left_list.empty()) continue;
 
-                for (int left_value : left_list) {
-                    if (left_value < min_left) continue;
-                    if (left_value > max_left) break;
+                int right_syl = s - op.syllables - left_syl;
+                if (right_syl < 0) continue;
+                const auto& right_list = syllable_key[right_syl][op.pemdas_right];
+                if (right_list.empty()) continue;
 
-                    auto [min_right, max_right] = get_second_extremes(op.id, min_missing, max_number, left_value);
-                    int right_syl = s - op.syllables - left_syl;
-                    if (right_syl < 0) continue;
+                // thread-local new outs per pemdas u
+                vector<vector<vector<int>>> newouts_locals(threads, vector<vector<int>>(pemdas_count));
 
-                    const auto& right_list = syllable_key[right_syl][op.pemdas_right];
-                    if (right_list.empty()) continue;
+                parallel_for_chunks(0, (int)left_list.size(), threads, [&](int bi, int ei) {
+                    int slot = bi * threads / std::max(1, (int)left_list.size());
+                    if (slot < 0) slot = 0;
+                    if (slot >= threads) slot = threads - 1;
 
-                    for (int right_value : right_list) {
-                        if (right_value < min_right) continue;
-                        if (right_value > max_right) break;
+                    auto& newouts = newouts_locals[slot];
 
-                        if (op.id == "fraction") {
-                            const auto& L = number_names[left_value];
-                            const auto& R = number_names[right_value];
-                            if (!L.auto_pass &&
-                                right_value != 2 &&
-                                L.zeroes >= R.digits &&
-                                (L.nonzero > 1 || R.nonzero > 1) &&
-                                L.names[1] == L.names[2]) {
+                    for (int idx = bi; idx < ei; ++idx) {
+                        int left_value = left_list[idx];
+                        if (left_value < min_left) continue;
+                        if (left_value > max_left) break;
+
+                        auto [min_right, max_right] = get_second_extremes(op.id, min_missing, max_number, left_value);
+
+                        for (int right_value : right_list) {
+                            if (right_value < min_right) continue;
+                            if (right_value > max_right) break;
+
+                            if (op.id == "fraction") {
+                                const auto& L = number_names[left_value];
+                                const auto& R = number_names[right_value];
+                                if (!L.auto_pass &&
+                                    right_value != 2 &&
+                                    L.zeroes >= R.digits &&
+                                    (L.nonzero > 1 || R.nonzero > 1) &&
+                                    L.names[1] == L.names[2]) {
+                                    continue;
+                                }
+                            }
+
+                            if (op.id == "^" && (size_t)right_value >= superscripts.size()) {
                                 continue;
                             }
-                        }
 
-                        if (op.id == "^" && (size_t)right_value >= superscripts.size()) {
-                            continue; // can't render exponent nicely
-                        }
+                            auto [out_ll, ok] = get_output(op.id, left_value, right_value);
+                            if (!ok) continue;
+                            if (out_ll < 0 || out_ll > max_number) continue;
+                            int out = (int)out_ll;
 
-                        auto [out_ll, ok] = get_output(op.id, left_value, right_value);
-                        if (!ok) continue;
-                        if (out_ll < 0 || out_ll > max_number) continue;
-                        int out = (int)out_ll;
+                            string new_name =
+                                number_names[left_value].names[op.pemdas_left] +
+                                op.text +
+                                number_names[right_value].names[op.pemdas_right] +
+                                op.suffix;
 
-                        string new_name =
-                            number_names[left_value].names[op.pemdas_left] +
-                            op.text +
-                            number_names[right_value].names[op.pemdas_right] +
-                            op.suffix;
+                            string new_equation = number_names[left_value].equations[op.pemdas_left];
 
-                        string new_equation = number_names[left_value].equations[op.pemdas_left];
-
-                        if (op.id == "^") {
-                            if (new_equation == number_names[left_value].equations[1]) {
-                                new_equation = new_equation + " " + superscripts[right_value];
+                            if (op.id == "^") {
+                                if (new_equation == number_names[left_value].equations[1]) {
+                                    new_equation = new_equation + " " + superscripts[right_value];
+                                } else {
+                                    new_equation = "(" + new_equation + ") " + superscripts[right_value];
+                                }
                             } else {
-                                new_equation = "(" + new_equation + ") " + superscripts[right_value];
+                                if (op.id == "fraction") new_equation += " / ";
+                                else new_equation += " " + op.id + " ";
+                                new_equation += number_names[right_value].equations[op.pemdas_right];
                             }
-                        } else {
-                            if (op.id == "fraction") new_equation += " / ";
-                            else new_equation += " " + op.id + " ";
-                            new_equation += number_names[right_value].equations[op.pemdas_right];
-                        }
 
-                        for (int u = op.pemdas_result; u < pemdas_count; ++u) {
-                            if (number_names[out].syllables[u] >= s) {
-                                number_names[out].names[u] = new_name;
-                                number_names[out].equations[u] = new_equation;
+                            // commit updates under a stripe lock
+                            {
+                                std::lock_guard<std::mutex> g(lock_for(out));
+                                for (int u = op.pemdas_result; u < pemdas_count; ++u) {
+                                    if (number_names[out].syllables[u] >= s) {
+                                        number_names[out].names[u] = new_name;
+                                        number_names[out].equations[u] = new_equation;
 
-                                if (number_names[out].syllables[u] > s) {
-                                    number_names[out].syllables[u] = s;
-                                    syllable_key[s][u].push_back(out);
+                                        if (number_names[out].syllables[u] > s) {
+                                            number_names[out].syllables[u] = s;
+                                            newouts[u].push_back(out);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+                });
+
+                // merge new outs into syllable_key[s][u]
+                for (int u = 0; u < pemdas_count; ++u) {
+                    for (int t = 0; t < threads; ++t) {
+                        auto& v = newouts_locals[t][u];
+                        if (!v.empty()) {
+                            syllable_key[s][u].insert(syllable_key[s][u].end(), v.begin(), v.end());
+                        }
+                    }
+                    std::sort(syllable_key[s][u].begin(), syllable_key[s][u].end());
+                    syllable_key[s][u].erase(std::unique(syllable_key[s][u].begin(), syllable_key[s][u].end()),
+                                             syllable_key[s][u].end());
                 }
             }
         }
 
-        // Unary ops
+        // ---- Unary ops (parallel over input list chunks) ----
         for (const auto& op : unary) {
             if (s <= op.syllables) continue;
 
@@ -388,41 +474,62 @@ static void number_names_generator(int leave_point, int max_number, bool show_pr
             const auto& in_list = syllable_key[in_syl][op.pemdas_input];
             if (in_list.empty()) continue;
 
-            for (int input_value : in_list) {
-                if (input_value < min_val) continue;
-                if (input_value > max_val) break;
+            vector<vector<vector<int>>> newouts_locals(threads, vector<vector<int>>(pemdas_count));
 
-                auto [out_ll, ok] = get_output(op.id, input_value);
-                if (!ok) continue;
-                if (out_ll < 0 || out_ll > max_number) continue;
-                int out = (int)out_ll;
+            parallel_for_chunks(0, (int)in_list.size(), threads, [&](int bi, int ei) {
+                int slot = bi * threads / std::max(1, (int)in_list.size());
+                if (slot < 0) slot = 0;
+                if (slot >= threads) slot = threads - 1;
 
-                string new_name = number_names[input_value].names[op.pemdas_input] + op.text;
+                auto& newouts = newouts_locals[slot];
 
-                string new_equation = number_names[input_value].equations[op.pemdas_input];
-                if (new_equation == number_names[input_value].equations[1]) {
-                    new_equation = new_equation + " " + op.id;
-                } else {
-                    new_equation = "(" + new_equation + ") " + op.id;
-                }
+                for (int idx = bi; idx < ei; ++idx) {
+                    int input_value = in_list[idx];
+                    if (input_value < min_val) continue;
+                    if (input_value > max_val) break;
 
-                for (int u = op.pemdas_result; u < pemdas_count; ++u) {
-                    if (number_names[out].syllables[u] >= s) {
-                        number_names[out].names[u] = new_name;
-                        number_names[out].equations[u] = new_equation;
+                    auto [out_ll, ok] = get_output(op.id, input_value);
+                    if (!ok) continue;
+                    if (out_ll < 0 || out_ll > max_number) continue;
+                    int out = (int)out_ll;
 
-                        if (number_names[out].syllables[u] > s) {
-                            number_names[out].syllables[u] = s;
-                            syllable_key[s][u].push_back(out);
+                    string new_name = number_names[input_value].names[op.pemdas_input] + op.text;
+
+                    string new_equation = number_names[input_value].equations[op.pemdas_input];
+                    if (new_equation == number_names[input_value].equations[1]) {
+                        new_equation = new_equation + " " + op.id;
+                    } else {
+                        new_equation = "(" + new_equation + ") " + op.id;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> g(lock_for(out));
+                        for (int u = op.pemdas_result; u < pemdas_count; ++u) {
+                            if (number_names[out].syllables[u] >= s) {
+                                number_names[out].names[u] = new_name;
+                                number_names[out].equations[u] = new_equation;
+
+                                if (number_names[out].syllables[u] > s) {
+                                    number_names[out].syllables[u] = s;
+                                    newouts[u].push_back(out);
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
+            });
 
-        // Sort for early breaks
-        for (int i = 0; i < pemdas_count; ++i) {
-            std::sort(syllable_key[s][i].begin(), syllable_key[s][i].end());
+            for (int u = 0; u < pemdas_count; ++u) {
+                for (int t = 0; t < threads; ++t) {
+                    auto& v = newouts_locals[t][u];
+                    if (!v.empty()) {
+                        syllable_key[s][u].insert(syllable_key[s][u].end(), v.begin(), v.end());
+                    }
+                }
+                std::sort(syllable_key[s][u].begin(), syllable_key[s][u].end());
+                syllable_key[s][u].erase(std::unique(syllable_key[s][u].begin(), syllable_key[s][u].end()),
+                                         syllable_key[s][u].end());
+            }
         }
 
         // Advance min_missing
@@ -457,8 +564,6 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (n_ll > 2000000) {
-        // This is not a correctness limit, just a sanity guard.
-        // Your algorithm is O(n * search) and will explode for huge n.
         std::cerr << "Refusing: number too large for a fresh full recompute in reasonable time.\n";
         std::cerr << "Try <= 2,000,000 or remove this guard in the source.\n";
         return 1;
@@ -485,18 +590,25 @@ int main(int argc, char** argv) {
     const auto& e = number_names[n];
     const string& name = e.names.back();
     const string& eq = e.equations.back();
-    int syl = e.syllables.back();
+    int best_syl = e.syllables.back();
+    int orig_syl = e.original;
+
+    auto diff_suffix = [&]() -> string {
+        return " (from " + std::to_string(orig_syl) + " to " + std::to_string(best_syl) + " syllies)";
+    };
 
     if (show == "name") {
-        std::cout << name << "\n";
+        std::cout << n << " -> " << name << diff_suffix() << "\n";
     } else if (show == "equation") {
-        std::cout << eq << "\n";
+        std::cout << n << " -> " << eq << diff_suffix() << "\n";
     } else if (show == "both") {
-        std::cout << name << " (" << eq << ")\n";
+        std::cout << n << " -> " << name << " (" << eq << ")" << diff_suffix() << "\n";
     } else if (show == "all") {
+        std::cout << "number: " << n << "\n";
         std::cout << "name: " << name << "\n";
         std::cout << "equation: " << eq << "\n";
-        std::cout << "syllables: " << syl << "\n";
+        std::cout << "syllables: " << best_syl << "\n";
+        std::cout << "original syllables: " << orig_syl << "\n";
     } else {
         std::cerr << "Invalid --show option.\n";
         return 1;
